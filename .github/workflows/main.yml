@@ -1,0 +1,195 @@
+name: Build vaultwarden
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    timeout-minutes: 120
+    # Make warnings errors, this is to prevent warnings slipping through.
+    # This is done globally to prevent rebuilds when the RUSTFLAGS env variable changes.
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+    strategy:
+      fail-fast: false
+      matrix:
+        channel:
+          - "rust-toolchain" # The version defined in rust-toolchain
+
+    name: Build and Test ${{ matrix.channel }}
+
+    steps:
+      - name: "set timezone"
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo timedatectl set-timezone "Asia/Shanghai"
+        
+      # Checkout the repo
+      - name: "Checkout"
+        uses: actions/checkout@c85c95e3d7251135ab7dc9ce3241c5835cc595a9 # v3.5.3
+      # End Checkout the repo
+
+
+      # Install dependencies
+      - name: "Install dependencies Ubuntu"
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl sqlite build-essential libmariadb-dev-compat libpq-dev libssl-dev pkg-config
+      # End Install dependencies
+
+
+      # Determine rust-toolchain version
+      - name: Init Variables
+        id: toolchain
+        shell: bash
+        run: |
+          if [[ "${{ matrix.channel }}" == 'rust-toolchain' ]]; then
+            RUST_TOOLCHAIN="$(cat rust-toolchain)"
+          else
+            RUST_TOOLCHAIN="${{ matrix.channel }}"
+          fi
+          echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}" | tee -a "${GITHUB_OUTPUT}"
+          echo "TAG_TIME=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+      # End Determine rust-toolchain version
+
+
+      # Only install the clippy and rustfmt components on the default rust-toolchain
+      - name: "Install rust-toolchain version"
+        uses: dtolnay/rust-toolchain@b44cb146d03e8d870c57ab64b80f04586349ca5d # master @ 2023-03-28 - 06:32 GMT+2
+        if: ${{ matrix.channel == 'rust-toolchain' }}
+        with:
+          toolchain: "${{steps.toolchain.outputs.RUST_TOOLCHAIN}}"
+          components: clippy, rustfmt
+      # End Uses the rust-toolchain file to determine version
+
+      # Enable Rust Caching
+      - uses: Swatinem/rust-cache@2656b87321093db1cb55fbd73183d195214fdfd1 # v2.5.0
+      # End Enable Rust Caching
+
+
+      # Show environment
+      - name: "Show environment"
+        run: |
+          rustc -vV
+          cargo -vV
+      # End Show environment
+
+
+      # Run cargo tests (In release mode to speed up future builds)
+      # First test all features together, afterwards test them separately.
+      - name: "test features: sqlite,enable_mimalloc"
+        id: test_sqlite_mimalloc
+        if: $${{ always() }}
+        run: |
+          cargo test --release --features sqlite,enable_mimalloc
+
+      - name: "test features: sqlite"
+        id: test_sqlite
+        if: $${{ always() }}
+        run: |
+          cargo test --release --features sqlite
+      # End Run cargo tests
+
+
+      # Run cargo clippy, and fail on warnings (In release mode to speed up future builds)
+      - name: "clippy features: sqlite,enable_mimalloc"
+        id: clippy
+        if: ${{ always() && matrix.channel == 'rust-toolchain' }}
+        run: |
+          cargo clippy --release --features sqlite,enable_mimalloc -- -D warnings
+      # End Run cargo clippy
+
+
+      # Run cargo fmt (Only run on rust-toolchain defined version)
+      - name: "check formatting"
+        id: formatting
+        if: ${{ always() && matrix.channel == 'rust-toolchain' }}
+        run: |
+          cargo fmt --all -- --check
+      # End Run cargo fmt
+
+
+      # Check for any previous failures, if there are stop, else continue.
+      # This is useful so all test/clippy/fmt actions are done, and they can all be addressed
+      - name: "Some checks failed"
+        if: ${{ failure() }}
+        run: |
+          echo "### :x: Checks Failed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "|Job|Status|" >> $GITHUB_STEP_SUMMARY
+          echo "|---|------|" >> $GITHUB_STEP_SUMMARY
+          echo "|test (sqlite,enable_mimalloc)|${{ steps.test_sqlite_mimalloc.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|test (sqlite)|${{ steps.test_sqlite.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|clippy (sqlite,enable_mimalloc)|${{ steps.clippy.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "|fmt|${{ steps.formatting.outcome }}|" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Please check the failed jobs and fix where needed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          exit 1
+
+
+      # Check for any previous failures, if there are stop, else continue.
+      # This is useful so all test/clippy/fmt actions are done, and they can all be addressed
+      - name: "All checks passed"
+        if: ${{ success() }}
+        run: |
+          echo "### :tada: Checks Passed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+
+      # Build the binary to upload to the artifacts
+      - name: "build features: sqlite"
+        if: ${{ matrix.channel == 'rust-toolchain' }}
+        run: |
+          cargo build --release --features sqlite
+      # End Build the binary
+
+
+      # Upload artifact to Github Actions
+      - name: "Upload artifact"
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v3.1.2
+        if: ${{ matrix.channel == 'rust-toolchain' }}
+        with:
+          name: vaultwarden
+          path: target/release/vaultwarden
+      # End Upload artifact to Github Actions
+      
+      # Upload artifact to Github Release
+      - name: "Upload Release"
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.TOKEN }}
+          file: target/release/vaultwarden
+          file_glob: true
+          tag: ${{ env.TAG_TIME }}
+          overwrite: true
+    
+      - name: "delete old Releases "
+        if: ${{ matrix.channel == 'rust-toolchain' }}
+        uses: dev-drprasad/delete-older-releases@master
+        with:
+            keep_latest: 1
+            delete_tags: true
+        env:
+            GITHUB_TOKEN: ${{ secrets.TOKEN }}      
+      # End Upload artifact to Github Release
+      
+      #- name: "Upload Release"
+      #  uses: svenstaro/upload-release-action@v2
+      #  with:
+      #    repo_token: ${{ secrets.TOKEN }}
+      #    file: target/release/vaultwarden
+      #    file_glob: true
+      #    tag: AutoUpload
+      #    overwrite: true
+        
+      - name: delete old workflow
+        continue-on-error: true
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 1
+          keep_minimum_runs: 0
