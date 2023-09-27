@@ -33,7 +33,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl build-essential libmariadb-dev-compat libpq-dev libssl-dev pkg-config
       # End Install dependencies
 
-
       # Determine rust-toolchain version
       - name: Init Variables
         id: toolchain
@@ -46,7 +45,6 @@ jobs:
           fi
           echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}" | tee -a "${GITHUB_OUTPUT}"
       # End Determine rust-toolchain version
-
 
       # Only install the clippy and rustfmt components on the default rust-toolchain
       - name: "Install rust-toolchain version"
@@ -90,7 +88,6 @@ jobs:
           cargo test --release --features sqlite,enable_mimalloc
       # End Run cargo tests
 
-
       # Run cargo clippy, and fail on warnings (In release mode to speed up future builds)
       - name: "clippy features: sqlite,enable_mimalloc"
         id: clippy
@@ -107,7 +104,6 @@ jobs:
         run: |
           cargo fmt --all -- --check
       # End Run cargo fmt
-
 
       # Check for any previous failures, if there are stop, else continue.
       # This is useful so all test/clippy/fmt actions are done, and they can all be addressed
@@ -126,7 +122,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           exit 1
 
-
       # Check for any previous failures, if there are stop, else continue.
       # This is useful so all test/clippy/fmt actions are done, and they can all be addressed
       - name: "All checks passed"
@@ -137,10 +132,10 @@ jobs:
 
 
       # Build the binary to upload to the artifacts
-      - name: "build features: sqlite,mysql,postgresql"
+      - name: "build features: sqlite"
         if: ${{ matrix.channel == 'rust-toolchain' }}
         run: |
-          cargo build --release --features sqlite,mysql,postgresql
+          cargo build --release --features sqlite
       # End Build the binary
 
 
