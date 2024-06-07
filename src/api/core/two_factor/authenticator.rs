@@ -5,7 +5,7 @@ use rocket::Route;
 use crate::{
     api::{
         core::log_user_event, core::two_factor::_generate_recover_code, EmptyResult, JsonResult, JsonUpcase,
-        NumberOrString, PasswordData,
+        PasswordOrOtpData,
     },
     auth::{ClientIp, Headers},
     crypto,
@@ -13,6 +13,7 @@ use crate::{
         models::{EventType, TwoFactor, TwoFactorType},
         DbConn,
     },
+    util::NumberOrString,
 };
 
 pub use crate::config::CONFIG;
@@ -22,13 +23,11 @@ pub fn routes() -> Vec<Route> {
 }
 
 #[post("/two-factor/get-authenticator", data = "<data>")]
-async fn generate_authenticator(data: JsonUpcase<PasswordData>, headers: Headers, mut conn: DbConn) -> JsonResult {
-    let data: PasswordData = data.into_inner().data;
+async fn generate_authenticator(data: JsonUpcase<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let data: PasswordOrOtpData = data.into_inner().data;
     let user = headers.user;
 
-    if !user.check_valid_password(&data.MasterPasswordHash) {
-        err!("Invalid password");
-    }
+    data.validate(&user, false, &mut conn).await?;
 
     let type_ = TwoFactorType::Authenticator as i32;
     let twofactor = TwoFactor::find_by_user_and_type(&user.uuid, type_, &mut conn).await;
@@ -48,9 +47,10 @@ async fn generate_authenticator(data: JsonUpcase<PasswordData>, headers: Headers
 #[derive(Deserialize, Debug)]
 #[allow(non_snake_case)]
 struct EnableAuthenticatorData {
-    MasterPasswordHash: String,
     Key: String,
     Token: NumberOrString,
+    MasterPasswordHash: Option<String>,
+    Otp: Option<String>,
 }
 
 #[post("/two-factor/authenticator", data = "<data>")]
@@ -60,15 +60,17 @@ async fn activate_authenticator(
     mut conn: DbConn,
 ) -> JsonResult {
     let data: EnableAuthenticatorData = data.into_inner().data;
-    let password_hash = data.MasterPasswordHash;
     let key = data.Key;
     let token = data.Token.into_string();
 
     let mut user = headers.user;
 
-    if !user.check_valid_password(&password_hash) {
-        err!("Invalid password");
+    PasswordOrOtpData {
+        MasterPasswordHash: data.MasterPasswordHash,
+        Otp: data.Otp,
     }
+    .validate(&user, true, &mut conn)
+    .await?;
 
     // Validate key as base32 and 20 bytes length
     let decoded_key: Vec<u8> = match BASE32.decode(key.as_bytes()) {
@@ -154,8 +156,8 @@ pub async fn validate_totp_code(
         let time = (current_timestamp + step * 30i64) as u64;
         let generated = totp_custom::<Sha1>(30, 6, &decoded_secret, time);
 
-        // Check the the given code equals the generated and if the time_step is larger then the one last used.
-        if generated == totp_code && time_step > i64::from(twofactor.last_used) {
+        // Check the given code equals the generated and if the time_step is larger then the one last used.
+        if generated == totp_code && time_step > twofactor.last_used {
             // If the step does not equals 0 the time is drifted either server or client side.
             if step != 0 {
                 warn!("TOTP Time drift detected. The step offset is {}", step);
@@ -163,10 +165,10 @@ pub async fn validate_totp_code(
 
             // Save the last used time step so only totp time steps higher then this one are allowed.
             // This will also save a newly created twofactor if the code is correct.
-            twofactor.last_used = time_step as i32;
+            twofactor.last_used = time_step;
             twofactor.save(conn).await?;
             return Ok(());
-        } else if generated == totp_code && time_step <= i64::from(twofactor.last_used) {
+        } else if generated == totp_code && time_step <= twofactor.last_used {
             warn!("This TOTP or a TOTP code within {} steps back or forward has already been used!", steps);
             err!(
                 format!("Invalid TOTP code! Server time: {} IP: {}", current_time.format("%F %T UTC"), ip.ip),

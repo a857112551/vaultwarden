@@ -21,7 +21,11 @@ const browserUTC = `${year}-${month}-${day} ${hour}:${minute}:${seconds} UTC`;
 
 // ================================
 // Check if the output is a valid IP
-const isValidIp = value => (/^(?:(?:^|\.)(?:2(?:5[0-5]|[0-4]\d)|1?\d?\d)){4}$/.test(value) ? true : false);
+function isValidIp(ip) {
+    const ipv4Regex = /^(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+    const ipv6Regex = /^(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}|((?:[a-fA-F0-9]{1,4}:){1,7}:|:(:[a-fA-F0-9]{1,4}){1,7}|[a-fA-F0-9]{1,4}:((:[a-fA-F0-9]{1,4}){1,6}))$/;
+    return ipv4Regex.test(ip) || ipv6Regex.test(ip);
+}
 
 function checkVersions(platform, installed, latest, commit=null) {
     if (installed === "-" || latest === "-") {
@@ -77,7 +81,7 @@ async function generateSupportString(event, dj) {
     supportString += `* Vaultwarden version: v${dj.current_release}\n`;
     supportString += `* Web-vault version: v${dj.web_vault_version}\n`;
     supportString += `* OS/Arch: ${dj.host_os}/${dj.host_arch}\n`;
-    supportString += `* Running within Docker: ${dj.running_within_docker} (Base: ${dj.docker_base_image})\n`;
+    supportString += `* Running within a container: ${dj.running_within_container} (Base: ${dj.container_base_image})\n`;
     supportString += "* Environment settings overridden: ";
     if (dj.overrides != "") {
         supportString += "true\n";
@@ -179,7 +183,7 @@ function initVersionCheck(dj) {
     }
     checkVersions("server", serverInstalled, serverLatest, serverLatestCommit);
 
-    if (!dj.running_within_docker) {
+    if (!dj.running_within_container) {
         const webInstalled = dj.web_vault_version;
         const webLatest = dj.latest_web_build;
         checkVersions("web", webInstalled, webLatest);

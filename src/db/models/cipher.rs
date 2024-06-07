@@ -1,5 +1,5 @@
 use crate::CONFIG;
-use chrono::{Duration, NaiveDateTime, Utc};
+use chrono::{NaiveDateTime, TimeDelta, Utc};
 use serde_json::Value;
 
 use super::{
@@ -23,12 +23,13 @@ db_object! {
         pub user_uuid: Option<String>,
         pub organization_uuid: Option<String>,
 
+        pub key: Option<String>,
+
         /*
         Login = 1,
         SecureNote = 2,
         Card = 3,
-        Identity = 4,
-        Fido2key = 5
+        Identity = 4
         */
         pub atype: i32,
         pub name: String,
@@ -61,6 +62,8 @@ impl Cipher {
 
             user_uuid: None,
             organization_uuid: None,
+
+            key: None,
 
             atype,
             name,
@@ -203,6 +206,7 @@ impl Cipher {
             "DeletedDate": self.deleted_at.map_or(Value::Null, |d| Value::String(format_date(&d))),
             "Reprompt": self.reprompt.unwrap_or(RepromptType::None as i32),
             "OrganizationId": self.organization_uuid,
+            "Key": self.key,
             "Attachments": attachments_json,
             // We have UseTotp set to true by default within the Organization model.
             // This variable together with UsersGetPremium is used to show or hide the TOTP counter.
@@ -224,7 +228,6 @@ impl Cipher {
             "SecureNote": null,
             "Card": null,
             "Identity": null,
-            "Fido2Key": null,
         });
 
         // These values are only needed for user/default syncs
@@ -253,7 +256,6 @@ impl Cipher {
             2 => "SecureNote",
             3 => "Card",
             4 => "Identity",
-            5 => "Fido2Key",
             _ => panic!("Wrong type"),
         };
 
@@ -271,7 +273,16 @@ impl Cipher {
             None => {
                 // Belongs to Organization, need to update affected users
                 if let Some(ref org_uuid) = self.organization_uuid {
-                    for user_org in UserOrganization::find_by_cipher_and_org(&self.uuid, org_uuid, conn).await.iter() {
+                    // users having access to the collection
+                    let mut collection_users =
+                        UserOrganization::find_by_cipher_and_org(&self.uuid, org_uuid, conn).await;
+                    if CONFIG.org_groups_enabled() {
+                        // members of a group having access to the collection
+                        let group_users =
+                            UserOrganization::find_by_cipher_and_org_with_group(&self.uuid, org_uuid, conn).await;
+                        collection_users.extend(group_users);
+                    }
+                    for user_org in collection_users {
                         User::update_uuid_revision(&user_org.user_uuid, conn).await;
                         user_uuids.push(user_org.user_uuid.clone())
                     }
@@ -350,7 +361,7 @@ impl Cipher {
     pub async fn purge_trash(conn: &mut DbConn) {
         if let Some(auto_delete_days) = CONFIG.trash_auto_delete_days() {
             let now = Utc::now().naive_utc();
-            let dt = now - Duration::days(auto_delete_days);
+            let dt = now - TimeDelta::try_days(auto_delete_days).unwrap();
             for cipher in Self::find_deleted_before(&dt, conn).await {
                 cipher.delete(conn).await.ok();
             }
@@ -415,9 +426,12 @@ impl Cipher {
         cipher_sync_data: Option<&CipherSyncData>,
         conn: &mut DbConn,
     ) -> bool {
+        if !CONFIG.org_groups_enabled() {
+            return false;
+        }
         if let Some(ref org_uuid) = self.organization_uuid {
             if let Some(cipher_sync_data) = cipher_sync_data {
-                return cipher_sync_data.user_group_full_access_for_organizations.get(org_uuid).is_some();
+                return cipher_sync_data.user_group_full_access_for_organizations.contains(org_uuid);
             } else {
                 return Group::is_in_full_access_group(user_uuid, org_uuid, conn).await;
             }
@@ -510,6 +524,9 @@ impl Cipher {
     }
 
     async fn get_group_collections_access_flags(&self, user_uuid: &str, conn: &mut DbConn) -> Vec<(bool, bool)> {
+        if !CONFIG.org_groups_enabled() {
+            return Vec::new();
+        }
         db_run! {conn: {
             ciphers::table
                 .filter(ciphers::uuid.eq(&self.uuid))
@@ -591,50 +608,84 @@ impl Cipher {
     // result, those ciphers will not appear in "My Vault" for the org
     // owner/admin, but they can still be accessed via the org vault view.
     pub async fn find_by_user(user_uuid: &str, visible_only: bool, conn: &mut DbConn) -> Vec<Self> {
-        db_run! {conn: {
-            let mut query = ciphers::table
-                .left_join(ciphers_collections::table.on(
-                    ciphers::uuid.eq(ciphers_collections::cipher_uuid)
-                ))
-                .left_join(users_organizations::table.on(
-                    ciphers::organization_uuid.eq(users_organizations::org_uuid.nullable())
-                        .and(users_organizations::user_uuid.eq(user_uuid))
-                        .and(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
-                ))
-                .left_join(users_collections::table.on(
-                    ciphers_collections::collection_uuid.eq(users_collections::collection_uuid)
-                        // Ensure that users_collections::user_uuid is NULL for unconfirmed users.
-                        .and(users_organizations::user_uuid.eq(users_collections::user_uuid))
-                ))
-                .left_join(groups_users::table.on(
-                    groups_users::users_organizations_uuid.eq(users_organizations::uuid)
-                ))
-                .left_join(groups::table.on(
-                    groups::uuid.eq(groups_users::groups_uuid)
-                ))
-                .left_join(collections_groups::table.on(
-                    collections_groups::collections_uuid.eq(ciphers_collections::collection_uuid).and(
-                        collections_groups::groups_uuid.eq(groups::uuid)
-                    )
-                ))
-                .filter(ciphers::user_uuid.eq(user_uuid)) // Cipher owner
-                .or_filter(users_organizations::access_all.eq(true)) // access_all in org
-                .or_filter(users_collections::user_uuid.eq(user_uuid)) // Access to collection
-                .or_filter(groups::access_all.eq(true)) // Access via groups
-                .or_filter(collections_groups::collections_uuid.is_not_null()) // Access via groups
-                .into_boxed();
+        if CONFIG.org_groups_enabled() {
+            db_run! {conn: {
+                let mut query = ciphers::table
+                    .left_join(ciphers_collections::table.on(
+                            ciphers::uuid.eq(ciphers_collections::cipher_uuid)
+                            ))
+                    .left_join(users_organizations::table.on(
+                            ciphers::organization_uuid.eq(users_organizations::org_uuid.nullable())
+                            .and(users_organizations::user_uuid.eq(user_uuid))
+                            .and(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                            ))
+                    .left_join(users_collections::table.on(
+                            ciphers_collections::collection_uuid.eq(users_collections::collection_uuid)
+                            // Ensure that users_collections::user_uuid is NULL for unconfirmed users.
+                            .and(users_organizations::user_uuid.eq(users_collections::user_uuid))
+                            ))
+                    .left_join(groups_users::table.on(
+                            groups_users::users_organizations_uuid.eq(users_organizations::uuid)
+                            ))
+                    .left_join(groups::table.on(
+                            groups::uuid.eq(groups_users::groups_uuid)
+                            ))
+                    .left_join(collections_groups::table.on(
+                            collections_groups::collections_uuid.eq(ciphers_collections::collection_uuid).and(
+                                collections_groups::groups_uuid.eq(groups::uuid)
+                                )
+                            ))
+                    .filter(ciphers::user_uuid.eq(user_uuid)) // Cipher owner
+                    .or_filter(users_organizations::access_all.eq(true)) // access_all in org
+                    .or_filter(users_collections::user_uuid.eq(user_uuid)) // Access to collection
+                    .or_filter(groups::access_all.eq(true)) // Access via groups
+                    .or_filter(collections_groups::collections_uuid.is_not_null()) // Access via groups
+                    .into_boxed();
 
-            if !visible_only {
-                query = query.or_filter(
-                    users_organizations::atype.le(UserOrgType::Admin as i32) // Org admin/owner
-                );
-            }
+                if !visible_only {
+                    query = query.or_filter(
+                        users_organizations::atype.le(UserOrgType::Admin as i32) // Org admin/owner
+                        );
+                }
 
-            query
-                .select(ciphers::all_columns)
-                .distinct()
-                .load::<CipherDb>(conn).expect("Error loading ciphers").from_db()
-        }}
+                query
+                    .select(ciphers::all_columns)
+                    .distinct()
+                    .load::<CipherDb>(conn).expect("Error loading ciphers").from_db()
+            }}
+        } else {
+            db_run! {conn: {
+                let mut query = ciphers::table
+                    .left_join(ciphers_collections::table.on(
+                            ciphers::uuid.eq(ciphers_collections::cipher_uuid)
+                            ))
+                    .left_join(users_organizations::table.on(
+                            ciphers::organization_uuid.eq(users_organizations::org_uuid.nullable())
+                            .and(users_organizations::user_uuid.eq(user_uuid))
+                            .and(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                            ))
+                    .left_join(users_collections::table.on(
+                            ciphers_collections::collection_uuid.eq(users_collections::collection_uuid)
+                            // Ensure that users_collections::user_uuid is NULL for unconfirmed users.
+                            .and(users_organizations::user_uuid.eq(users_collections::user_uuid))
+                            ))
+                    .filter(ciphers::user_uuid.eq(user_uuid)) // Cipher owner
+                    .or_filter(users_organizations::access_all.eq(true)) // access_all in org
+                    .or_filter(users_collections::user_uuid.eq(user_uuid)) // Access to collection
+                    .into_boxed();
+
+                    if !visible_only {
+                        query = query.or_filter(
+                            users_organizations::atype.le(UserOrgType::Admin as i32) // Org admin/owner
+                            );
+                    }
+
+                query
+                    .select(ciphers::all_columns)
+                    .distinct()
+                    .load::<CipherDb>(conn).expect("Error loading ciphers").from_db()
+            }}
+        }
     }
 
     // Find all ciphers visible to the specified user.

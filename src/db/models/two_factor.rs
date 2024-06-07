@@ -12,7 +12,7 @@ db_object! {
         pub atype: i32,
         pub enabled: bool,
         pub data: String,
-        pub last_used: i32,
+        pub last_used: i64,
     }
 }
 
@@ -34,6 +34,9 @@ pub enum TwoFactorType {
     EmailVerificationChallenge = 1002,
     WebauthnRegisterChallenge = 1003,
     WebauthnLoginChallenge = 1004,
+
+    // Special type for Protected Actions verification via email
+    ProtectedActions = 2000,
 }
 
 /// Local methods

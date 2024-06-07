@@ -7,7 +7,6 @@ use diesel::{
 
 use rocket::{
     http::Status,
-    outcome::IntoOutcome,
     request::{FromRequest, Outcome},
     Request,
 };
@@ -413,8 +412,11 @@ impl<'r> FromRequest<'r> for DbConn {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         match request.rocket().state::<DbPool>() {
-            Some(p) => p.get().await.map_err(|_| ()).into_outcome(Status::ServiceUnavailable),
-            None => Outcome::Failure((Status::InternalServerError, ())),
+            Some(p) => match p.get().await {
+                Ok(dbconn) => Outcome::Success(dbconn),
+                _ => Outcome::Error((Status::ServiceUnavailable, ())),
+            },
+            None => Outcome::Error((Status::InternalServerError, ())),
         }
     }
 }
@@ -479,21 +481,9 @@ mod postgresql_migrations {
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/postgresql");
 
     pub fn run_migrations() -> Result<(), super::Error> {
-        use diesel::{Connection, RunQueryDsl};
+        use diesel::Connection;
         // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
         let mut connection = diesel::pg::PgConnection::establish(&crate::CONFIG.database_url())?;
-        // Disable Foreign Key Checks during migration
-
-        // FIXME: Per https://www.postgresql.org/docs/12/sql-set-constraints.html,
-        // "SET CONSTRAINTS sets the behavior of constraint checking within the
-        // current transaction", so this setting probably won't take effect for
-        // any of the migrations since it's being run outside of a transaction.
-        // Migrations that need to disable foreign key checks should run this
-        // from within the migration script itself.
-        diesel::sql_query("SET CONSTRAINTS ALL DEFERRED")
-            .execute(&mut connection)
-            .expect("Failed to disable Foreign Key Checks during migrations");
-
         connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }

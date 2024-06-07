@@ -1,4 +1,4 @@
-use chrono::{Duration, NaiveDateTime, Utc};
+use chrono::{NaiveDateTime, TimeDelta, Utc};
 use serde_json::Value;
 
 use crate::crypto;
@@ -51,7 +51,7 @@ db_object! {
 
         pub avatar_color: Option<String>,
 
-        pub external_id: Option<String>,
+        pub external_id: Option<String>, // Todo: Needs to be removed in the future, this is not used anymore.
     }
 
     #[derive(Identifiable, Queryable, Insertable)]
@@ -129,7 +129,7 @@ impl User {
 
             avatar_color: None,
 
-            external_id: None,
+            external_id: None, // Todo: Needs to be removed in the future, this is not used anymore.
         }
     }
 
@@ -152,18 +152,6 @@ impl User {
 
     pub fn check_valid_api_key(&self, key: &str) -> bool {
         matches!(self.api_key, Some(ref api_key) if crate::crypto::ct_eq(api_key, key))
-    }
-
-    pub fn set_external_id(&mut self, external_id: Option<String>) {
-        //Check if external id is empty. We don't want to have
-        //empty strings in the database
-        let mut ext_id: Option<String> = None;
-        if let Some(external_id) = external_id {
-            if !external_id.is_empty() {
-                ext_id = Some(external_id);
-            }
-        }
-        self.external_id = ext_id;
     }
 
     /// Set the password hash generated
@@ -214,7 +202,7 @@ impl User {
         let stamp_exception = UserStampException {
             routes: route_exception,
             security_stamp: self.security_stamp.clone(),
-            expire: (Utc::now().naive_utc() + Duration::minutes(2)).timestamp(),
+            expire: (Utc::now() + TimeDelta::try_minutes(2).unwrap()).timestamp(),
         };
         self.stamp_exception = Some(serde_json::to_string(&stamp_exception).unwrap_or_default());
     }
@@ -258,6 +246,7 @@ impl User {
             "Email": self.email,
             "EmailVerified": !CONFIG.mail_enabled() || self.verified_at.is_some(),
             "Premium": true,
+            "PremiumFromOrganization": false,
             "MasterPasswordHint": self.password_hint,
             "Culture": "en-US",
             "TwoFactorEnabled": twofactor_enabled,
@@ -269,6 +258,7 @@ impl User {
             "ProviderOrganizations": [],
             "ForcePasswordReset": false,
             "AvatarColor": self.avatar_color,
+            "UsesKeyConnector": false,
             "Object": "profile",
         })
     }
@@ -323,6 +313,7 @@ impl User {
 
         Send::delete_all_by_user(&self.uuid, conn).await?;
         EmergencyAccess::delete_all_by_user(&self.uuid, conn).await?;
+        EmergencyAccess::delete_all_by_grantee_email(&self.email, conn).await?;
         UserOrganization::delete_all_by_user(&self.uuid, conn).await?;
         Cipher::delete_all_by_user(&self.uuid, conn).await?;
         Favorite::delete_all_by_user(&self.uuid, conn).await?;
@@ -389,12 +380,6 @@ impl User {
     pub async fn find_by_uuid(uuid: &str, conn: &mut DbConn) -> Option<Self> {
         db_run! {conn: {
             users::table.filter(users::uuid.eq(uuid)).first::<UserDb>(conn).ok().from_db()
-        }}
-    }
-
-    pub async fn find_by_external_id(id: &str, conn: &mut DbConn) -> Option<Self> {
-        db_run! {conn: {
-            users::table.filter(users::external_id.eq(id)).first::<UserDb>(conn).ok().from_db()
         }}
     }
 

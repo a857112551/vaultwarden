@@ -13,14 +13,18 @@ use rocket::{
 };
 
 use crate::{
-    api::{core::log_event, unregister_push_device, ApiResult, EmptyResult, JsonResult, Notify, NumberOrString},
+    api::{
+        core::{log_event, two_factor},
+        unregister_push_device, ApiResult, EmptyResult, JsonResult, Notify,
+    },
     auth::{decode_admin, encode_jwt, generate_admin_claims, ClientIp},
     config::ConfigBuilder,
     db::{backup_database, get_sql_server_version, models::*, DbConn, DbConnType},
     error::{Error, MapResult},
     mail,
     util::{
-        docker_base_image, format_naive_datetime_local, get_display_size, get_reqwest_client, is_running_in_docker,
+        container_base_image, format_naive_datetime_local, get_display_size, get_reqwest_client,
+        is_running_in_container, NumberOrString,
     },
     CONFIG, VERSION,
 };
@@ -184,12 +188,11 @@ fn post_admin_login(data: Form<LoginForm>, cookies: &CookieJar<'_>, ip: ClientIp
         let claims = generate_admin_claims();
         let jwt = encode_jwt(&claims);
 
-        let cookie = Cookie::build(COOKIE_NAME, jwt)
+        let cookie = Cookie::build((COOKIE_NAME, jwt))
             .path(admin_path())
             .max_age(rocket::time::Duration::minutes(CONFIG.admin_session_lifetime()))
             .same_site(SameSite::Strict)
-            .http_only(true)
-            .finish();
+            .http_only(true);
 
         cookies.add(cookie);
         if let Some(redirect) = redirect {
@@ -279,12 +282,11 @@ async fn get_user_or_404(uuid: &str, conn: &mut DbConn) -> ApiResult<User> {
 #[post("/invite", data = "<data>")]
 async fn invite_user(data: Json<InviteData>, _token: AdminToken, mut conn: DbConn) -> JsonResult {
     let data: InviteData = data.into_inner();
-    let email = data.email.clone();
     if User::find_by_mail(&data.email, &mut conn).await.is_some() {
         err_code!("User already exists", Status::Conflict.code)
     }
 
-    let mut user = User::new(email);
+    let mut user = User::new(data.email);
 
     async fn _generate_invite(user: &User, conn: &mut DbConn) -> EmptyResult {
         if CONFIG.mail_enabled() {
@@ -314,7 +316,7 @@ async fn test_smtp(data: Json<InviteData>, _token: AdminToken) -> EmptyResult {
 
 #[get("/logout")]
 fn logout(cookies: &CookieJar<'_>) -> Redirect {
-    cookies.remove(Cookie::build(COOKIE_NAME, "").path(admin_path()).finish());
+    cookies.remove(Cookie::build(COOKIE_NAME).path(admin_path()));
     Redirect::to(admin_path())
 }
 
@@ -326,6 +328,10 @@ async fn get_users_json(_token: AdminToken, mut conn: DbConn) -> Json<Value> {
         let mut usr = u.to_json(&mut conn).await;
         usr["UserEnabled"] = json!(u.enabled);
         usr["CreatedAt"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
+        usr["LastActive"] = match u.last_active(&mut conn).await {
+            Some(dt) => json!(format_naive_datetime_local(&dt, DT_FMT)),
+            None => json!(None::<String>),
+        };
         users_json.push(usr);
     }
 
@@ -340,7 +346,7 @@ async fn users_overview(_token: AdminToken, mut conn: DbConn) -> ApiResult<Html<
         let mut usr = u.to_json(&mut conn).await;
         usr["cipher_count"] = json!(Cipher::count_owned_by_user(&u.uuid, &mut conn).await);
         usr["attachment_count"] = json!(Attachment::count_by_user(&u.uuid, &mut conn).await);
-        usr["attachment_size"] = json!(get_display_size(Attachment::size_by_user(&u.uuid, &mut conn).await as i32));
+        usr["attachment_size"] = json!(get_display_size(Attachment::size_by_user(&u.uuid, &mut conn).await));
         usr["user_enabled"] = json!(u.enabled);
         usr["created_at"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
         usr["last_active"] = match u.last_active(&mut conn).await {
@@ -388,7 +394,7 @@ async fn delete_user(uuid: &str, token: AdminToken, mut conn: DbConn) -> EmptyRe
             EventType::OrganizationUserRemoved as i32,
             &user_org.uuid,
             &user_org.org_uuid,
-            String::from(ACTING_ADMIN_USER),
+            ACTING_ADMIN_USER,
             14, // Use UnknownBrowser type
             &token.ip.ip,
             &mut conn,
@@ -407,7 +413,7 @@ async fn deauth_user(uuid: &str, _token: AdminToken, mut conn: DbConn, nt: Notif
 
     if CONFIG.push_enabled() {
         for device in Device::find_push_devices_by_user(&user.uuid, &mut conn).await {
-            match unregister_push_device(device.uuid).await {
+            match unregister_push_device(device.push_uuid).await {
                 Ok(r) => r,
                 Err(e) => error!("Unable to unregister devices from Bitwarden server: {}", e),
             };
@@ -443,9 +449,10 @@ async fn enable_user(uuid: &str, _token: AdminToken, mut conn: DbConn) -> EmptyR
 }
 
 #[post("/users/<uuid>/remove-2fa")]
-async fn remove_2fa(uuid: &str, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
+async fn remove_2fa(uuid: &str, token: AdminToken, mut conn: DbConn) -> EmptyResult {
     let mut user = get_user_or_404(uuid, &mut conn).await?;
     TwoFactor::delete_all_by_user(&user.uuid, &mut conn).await?;
+    two_factor::enforce_2fa_policy(&user, ACTING_ADMIN_USER, 14, &token.ip.ip, &mut conn).await?;
     user.totp_recover = None;
     user.save(&mut conn).await
 }
@@ -503,7 +510,11 @@ async fn update_user_org_type(data: Json<UserOrgTypeData>, token: AdminToken, mu
         match OrgPolicy::is_user_allowed(&user_to_edit.user_uuid, &user_to_edit.org_uuid, true, &mut conn).await {
             Ok(_) => {}
             Err(OrgPolicyErr::TwoFactorMissing) => {
-                err!("You cannot modify this user to this type because it has no two-step login method activated");
+                if CONFIG.email_2fa_auto_fallback() {
+                    two_factor::email::find_and_activate_email_2fa(&user_to_edit.user_uuid, &mut conn).await?;
+                } else {
+                    err!("You cannot modify this user to this type because they have not setup 2FA");
+                }
             }
             Err(OrgPolicyErr::SingleOrgEnforced) => {
                 err!("You cannot modify this user to this type because it is a member of an organization which forbids it");
@@ -515,7 +526,7 @@ async fn update_user_org_type(data: Json<UserOrgTypeData>, token: AdminToken, mu
         EventType::OrganizationUserUpdated as i32,
         &user_to_edit.uuid,
         &data.org_uuid,
-        String::from(ACTING_ADMIN_USER),
+        ACTING_ADMIN_USER,
         14, // Use UnknownBrowser type
         &token.ip.ip,
         &mut conn,
@@ -543,7 +554,7 @@ async fn organizations_overview(_token: AdminToken, mut conn: DbConn) -> ApiResu
         org["group_count"] = json!(Group::count_by_org(&o.uuid, &mut conn).await);
         org["event_count"] = json!(Event::count_by_org(&o.uuid, &mut conn).await);
         org["attachment_count"] = json!(Attachment::count_by_org(&o.uuid, &mut conn).await);
-        org["attachment_size"] = json!(get_display_size(Attachment::size_by_org(&o.uuid, &mut conn).await as i32));
+        org["attachment_size"] = json!(get_display_size(Attachment::size_by_org(&o.uuid, &mut conn).await));
         organizations_json.push(org);
     }
 
@@ -601,7 +612,7 @@ use cached::proc_macro::cached;
 /// Cache this function to prevent API call rate limit. Github only allows 60 requests per hour, and we use 3 here already.
 /// It will cache this function for 300 seconds (5 minutes) which should prevent the exhaustion of the rate limit.
 #[cached(time = 300, sync_writes = true)]
-async fn get_release_info(has_http_access: bool, running_within_docker: bool) -> (String, String, String) {
+async fn get_release_info(has_http_access: bool, running_within_container: bool) -> (String, String, String) {
     // If the HTTP Check failed, do not even attempt to check for new versions since we were not able to connect with github.com anyway.
     if has_http_access {
         (
@@ -618,9 +629,9 @@ async fn get_release_info(has_http_access: bool, running_within_docker: bool) ->
                 }
                 _ => "-".to_string(),
             },
-            // Do not fetch the web-vault version when running within Docker.
+            // Do not fetch the web-vault version when running within a container.
             // The web-vault version is embedded within the container it self, and should not be updated manually
-            if running_within_docker {
+            if running_within_container {
                 "-".to_string()
             } else {
                 match get_json_api::<GitRelease>(
@@ -674,7 +685,7 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
         };
 
     // Execute some environment checks
-    let running_within_docker = is_running_in_docker();
+    let running_within_container = is_running_in_container();
     let has_http_access = has_http_access().await;
     let uses_proxy = env::var_os("HTTP_PROXY").is_some()
         || env::var_os("http_proxy").is_some()
@@ -688,12 +699,9 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
     };
 
     let (latest_release, latest_commit, latest_web_build) =
-        get_release_info(has_http_access, running_within_docker).await;
+        get_release_info(has_http_access, running_within_container).await;
 
-    let ip_header_name = match &ip_header.0 {
-        Some(h) => h,
-        _ => "",
-    };
+    let ip_header_name = &ip_header.0.unwrap_or_default();
 
     let diagnostics_json = json!({
         "dns_resolved": dns_resolved,
@@ -703,11 +711,11 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) 
         "web_vault_enabled": &CONFIG.web_vault_enabled(),
         "web_vault_version": web_vault_version.version.trim_start_matches('v'),
         "latest_web_build": latest_web_build,
-        "running_within_docker": running_within_docker,
-        "docker_base_image": if running_within_docker { docker_base_image() } else { "Not applicable" },
+        "running_within_container": running_within_container,
+        "container_base_image": if running_within_container { container_base_image() } else { "Not applicable" },
         "has_http_access": has_http_access,
-        "ip_header_exists": &ip_header.0.is_some(),
-        "ip_header_match": ip_header_name == CONFIG.ip_header(),
+        "ip_header_exists": !ip_header_name.is_empty(),
+        "ip_header_match": ip_header_name.eq(&CONFIG.ip_header()),
         "ip_header_name": ip_header_name,
         "ip_header_config": &CONFIG.ip_header(),
         "uses_proxy": uses_proxy,
@@ -783,16 +791,16 @@ impl<'r> FromRequest<'r> for AdminToken {
                     if requested_page.is_empty() {
                         return Outcome::Forward(Status::Unauthorized);
                     } else {
-                        return Outcome::Failure((Status::Unauthorized, "Unauthorized"));
+                        return Outcome::Error((Status::Unauthorized, "Unauthorized"));
                     }
                 }
             };
 
             if decode_admin(access_token).is_err() {
                 // Remove admin cookie
-                cookies.remove(Cookie::build(COOKIE_NAME, "").path(admin_path()).finish());
+                cookies.remove(Cookie::build(COOKIE_NAME).path(admin_path()));
                 error!("Invalid or expired admin JWT. IP: {}.", &ip.ip);
-                return Outcome::Failure((Status::Unauthorized, "Session expired"));
+                return Outcome::Error((Status::Unauthorized, "Session expired"));
             }
 
             Outcome::Success(Self {

@@ -1,20 +1,26 @@
-use chrono::{Duration, Utc};
+use chrono::{TimeDelta, Utc};
 use data_encoding::BASE32;
 use rocket::serde::json::Json;
 use rocket::Route;
 use serde_json::Value;
 
 use crate::{
-    api::{core::log_user_event, JsonResult, JsonUpcase, NumberOrString, PasswordData},
+    api::{
+        core::{log_event, log_user_event},
+        EmptyResult, JsonResult, JsonUpcase, PasswordOrOtpData,
+    },
     auth::{ClientHeaders, Headers},
     crypto,
     db::{models::*, DbConn, DbPool},
-    mail, CONFIG,
+    mail,
+    util::NumberOrString,
+    CONFIG,
 };
 
 pub mod authenticator;
 pub mod duo;
 pub mod email;
+pub mod protected_actions;
 pub mod webauthn;
 pub mod yubikey;
 
@@ -33,6 +39,7 @@ pub fn routes() -> Vec<Route> {
     routes.append(&mut email::routes());
     routes.append(&mut webauthn::routes());
     routes.append(&mut yubikey::routes());
+    routes.append(&mut protected_actions::routes());
 
     routes
 }
@@ -50,13 +57,11 @@ async fn get_twofactor(headers: Headers, mut conn: DbConn) -> Json<Value> {
 }
 
 #[post("/two-factor/get-recover", data = "<data>")]
-fn get_recover(data: JsonUpcase<PasswordData>, headers: Headers) -> JsonResult {
-    let data: PasswordData = data.into_inner().data;
+async fn get_recover(data: JsonUpcase<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let data: PasswordOrOtpData = data.into_inner().data;
     let user = headers.user;
 
-    if !user.check_valid_password(&data.MasterPasswordHash) {
-        err!("Invalid password");
-    }
+    data.validate(&user, true, &mut conn).await?;
 
     Ok(Json(json!({
         "Code": user.totp_recover,
@@ -96,6 +101,7 @@ async fn recover(data: JsonUpcase<RecoverTwoFactor>, client_headers: ClientHeade
 
     // Remove all twofactors from the user
     TwoFactor::delete_all_by_user(&user.uuid, &mut conn).await?;
+    enforce_2fa_policy(&user, &user.uuid, client_headers.device_type, &client_headers.ip.ip, &mut conn).await?;
 
     log_user_event(
         EventType::UserRecovered2fa as i32,
@@ -123,19 +129,23 @@ async fn _generate_recover_code(user: &mut User, conn: &mut DbConn) {
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
 struct DisableTwoFactorData {
-    MasterPasswordHash: String,
+    MasterPasswordHash: Option<String>,
+    Otp: Option<String>,
     Type: NumberOrString,
 }
 
 #[post("/two-factor/disable", data = "<data>")]
 async fn disable_twofactor(data: JsonUpcase<DisableTwoFactorData>, headers: Headers, mut conn: DbConn) -> JsonResult {
     let data: DisableTwoFactorData = data.into_inner().data;
-    let password_hash = data.MasterPasswordHash;
     let user = headers.user;
 
-    if !user.check_valid_password(&password_hash) {
-        err!("Invalid password");
+    // Delete directly after a valid token has been provided
+    PasswordOrOtpData {
+        MasterPasswordHash: data.MasterPasswordHash,
+        Otp: data.Otp,
     }
+    .validate(&user, true, &mut conn)
+    .await?;
 
     let type_ = data.Type.into_i32()?;
 
@@ -145,22 +155,8 @@ async fn disable_twofactor(data: JsonUpcase<DisableTwoFactorData>, headers: Head
             .await;
     }
 
-    let twofactor_disabled = TwoFactor::find_by_user(&user.uuid, &mut conn).await.is_empty();
-
-    if twofactor_disabled {
-        for user_org in
-            UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::TwoFactorAuthentication, &mut conn)
-                .await
-                .into_iter()
-        {
-            if user_org.atype < UserOrgType::Admin {
-                if CONFIG.mail_enabled() {
-                    let org = Organization::find_by_uuid(&user_org.org_uuid, &mut conn).await.unwrap();
-                    mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
-                }
-                user_org.delete(&mut conn).await?;
-            }
-        }
+    if TwoFactor::find_by_user(&user.uuid, &mut conn).await.is_empty() {
+        enforce_2fa_policy(&user, &user.uuid, headers.device.atype, &headers.ip.ip, &mut conn).await?;
     }
 
     Ok(Json(json!({
@@ -173,6 +169,78 @@ async fn disable_twofactor(data: JsonUpcase<DisableTwoFactorData>, headers: Head
 #[put("/two-factor/disable", data = "<data>")]
 async fn disable_twofactor_put(data: JsonUpcase<DisableTwoFactorData>, headers: Headers, conn: DbConn) -> JsonResult {
     disable_twofactor(data, headers, conn).await
+}
+
+pub async fn enforce_2fa_policy(
+    user: &User,
+    act_uuid: &str,
+    device_type: i32,
+    ip: &std::net::IpAddr,
+    conn: &mut DbConn,
+) -> EmptyResult {
+    for member in UserOrganization::find_by_user_and_policy(&user.uuid, OrgPolicyType::TwoFactorAuthentication, conn)
+        .await
+        .into_iter()
+    {
+        // Policy only applies to non-Owner/non-Admin members who have accepted joining the org
+        if member.atype < UserOrgType::Admin {
+            if CONFIG.mail_enabled() {
+                let org = Organization::find_by_uuid(&member.org_uuid, conn).await.unwrap();
+                mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
+            }
+            let mut member = member;
+            member.revoke();
+            member.save(conn).await?;
+
+            log_event(
+                EventType::OrganizationUserRevoked as i32,
+                &member.uuid,
+                &member.org_uuid,
+                act_uuid,
+                device_type,
+                ip,
+                conn,
+            )
+            .await;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn enforce_2fa_policy_for_org(
+    org_uuid: &str,
+    act_uuid: &str,
+    device_type: i32,
+    ip: &std::net::IpAddr,
+    conn: &mut DbConn,
+) -> EmptyResult {
+    let org = Organization::find_by_uuid(org_uuid, conn).await.unwrap();
+    for member in UserOrganization::find_confirmed_by_org(org_uuid, conn).await.into_iter() {
+        // Don't enforce the policy for Admins and Owners.
+        if member.atype < UserOrgType::Admin && TwoFactor::find_by_user(&member.user_uuid, conn).await.is_empty() {
+            if CONFIG.mail_enabled() {
+                let user = User::find_by_uuid(&member.user_uuid, conn).await.unwrap();
+                mail::send_2fa_removed_from_org(&user.email, &org.name).await?;
+            }
+            let mut member = member;
+            member.revoke();
+            member.save(conn).await?;
+
+            log_event(
+                EventType::OrganizationUserRevoked as i32,
+                &member.uuid,
+                org_uuid,
+                act_uuid,
+                device_type,
+                ip,
+                conn,
+            )
+            .await;
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn send_incomplete_2fa_notifications(pool: DbPool) {
@@ -191,7 +259,7 @@ pub async fn send_incomplete_2fa_notifications(pool: DbPool) {
     };
 
     let now = Utc::now().naive_utc();
-    let time_limit = Duration::minutes(CONFIG.incomplete_2fa_time_limit());
+    let time_limit = TimeDelta::try_minutes(CONFIG.incomplete_2fa_time_limit()).unwrap();
     let time_before = now - time_limit;
     let incomplete_logins = TwoFactorIncomplete::find_logins_before(&time_before, &mut conn).await;
     for login in incomplete_logins {

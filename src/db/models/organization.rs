@@ -31,6 +31,7 @@ db_object! {
         pub status: i32,
         pub atype: i32,
         pub reset_password_key: Option<String>,
+        pub external_id: Option<String>,
     }
 
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -208,19 +209,37 @@ impl UserOrganization {
             status: UserOrgStatus::Accepted as i32,
             atype: UserOrgType::User as i32,
             reset_password_key: None,
+            external_id: None,
         }
     }
 
-    pub fn restore(&mut self) {
-        if self.status < UserOrgStatus::Accepted as i32 {
+    pub fn restore(&mut self) -> bool {
+        if self.status < UserOrgStatus::Invited as i32 {
             self.status += ACTIVATE_REVOKE_DIFF;
+            return true;
         }
+        false
     }
 
-    pub fn revoke(&mut self) {
+    pub fn revoke(&mut self) -> bool {
         if self.status > UserOrgStatus::Revoked as i32 {
             self.status -= ACTIVATE_REVOKE_DIFF;
+            return true;
         }
+        false
+    }
+
+    pub fn set_external_id(&mut self, external_id: Option<String>) -> bool {
+        //Check if external id is empty. We don't want to have
+        //empty strings in the database
+        if self.external_id != external_id {
+            self.external_id = match external_id {
+                Some(external_id) if !external_id.is_empty() => Some(external_id),
+                _ => None,
+            };
+            return true;
+        }
+        false
     }
 }
 
@@ -297,6 +316,7 @@ impl Organization {
         UserOrganization::delete_all_by_organization(&self.uuid, conn).await?;
         OrgPolicy::delete_all_by_organization(&self.uuid, conn).await?;
         Group::delete_all_by_organization(&self.uuid, conn).await?;
+        OrganizationApiKey::delete_all_by_organization(&self.uuid, conn).await?;
 
         db_run! { conn: {
             diesel::delete(organizations::table.filter(organizations::uuid.eq(self.uuid)))
@@ -325,6 +345,25 @@ impl UserOrganization {
     pub async fn to_json(&self, conn: &mut DbConn) -> Value {
         let org = Organization::find_by_uuid(&self.org_uuid, conn).await.unwrap();
 
+        let permissions = json!({
+                // TODO: Add support for Custom User Roles
+                // See: https://bitwarden.com/help/article/user-types-access-control/#custom-role
+                "accessEventLogs": false,
+                "accessImportExport": false,
+                "accessReports": false,
+                "createNewCollections": false,
+                "editAnyCollection": false,
+                "deleteAnyCollection": false,
+                "editAssignedCollections": false,
+                "deleteAssignedCollections": false,
+                "manageGroups": false,
+                "managePolicies": false,
+                "manageSso": false, // Not supported
+                "manageUsers": false,
+                "manageResetPassword": false,
+                "manageScim": false // Not supported (Not AGPLv3 Licensed)
+        });
+
         // https://github.com/bitwarden/server/blob/13d1e74d6960cf0d042620b72d85bf583a4236f7/src/Api/Models/Response/ProfileOrganizationResponseModel.cs
         json!({
             "Id": self.org_uuid,
@@ -352,27 +391,7 @@ impl UserOrganization {
             // "KeyConnectorEnabled": false,
             // "KeyConnectorUrl": null,
 
-            // TODO: Add support for Custom User Roles
-            // See: https://bitwarden.com/help/article/user-types-access-control/#custom-role
-            // "Permissions": {
-            //     "AccessEventLogs": false,
-            //     "AccessImportExport": false,
-            //     "AccessReports": false,
-            //     "ManageAllCollections": false,
-            //     "CreateNewCollections": false,
-            //     "EditAnyCollection": false,
-            //     "DeleteAnyCollection": false,
-            //     "ManageAssignedCollections": false,
-            //     "editAssignedCollections": false,
-            //     "deleteAssignedCollections": false,
-            //     "ManageCiphers": false,
-            //     "ManageGroups": false,
-            //     "ManagePolicies": false,
-            //     "ManageResetPassword": false,
-            //     "ManageSso": false, // Not supported
-            //     "ManageUsers": false,
-            //     "ManageScim": false, // Not supported (Not AGPLv3 Licensed)
-            // },
+            "permissions": permissions,
 
             "MaxStorageGb": 10, // The value doesn't matter, we don't check server-side
 
@@ -434,7 +453,7 @@ impl UserOrganization {
             "UserId": self.user_uuid,
             "Name": user.name,
             "Email": user.email,
-            "ExternalId": user.external_id,
+            "ExternalId": self.external_id,
             "Groups": groups,
             "Collections": collections,
 
@@ -629,8 +648,7 @@ impl UserOrganization {
         db_run! { conn: {
             users_organizations::table
                 .filter(users_organizations::user_uuid.eq(user_uuid))
-                .filter(users_organizations::status.eq(UserOrgStatus::Accepted as i32))
-                .or_filter(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                .filter(users_organizations::status.eq(UserOrgStatus::Accepted as i32).or(users_organizations::status.eq(UserOrgStatus::Confirmed as i32)))
                 .count()
                 .first::<i64>(conn)
                 .unwrap_or(0)
@@ -643,6 +661,16 @@ impl UserOrganization {
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .load::<UserOrganizationDb>(conn)
                 .expect("Error loading user organizations").from_db()
+        }}
+    }
+
+    pub async fn find_confirmed_by_org(org_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+        db_run! { conn: {
+            users_organizations::table
+                .filter(users_organizations::org_uuid.eq(org_uuid))
+                .filter(users_organizations::status.eq(UserOrgStatus::Confirmed as i32))
+                .load::<UserOrganizationDb>(conn)
+                .unwrap_or_default().from_db()
         }}
     }
 
@@ -750,6 +778,32 @@ impl UserOrganization {
         }}
     }
 
+    pub async fn find_by_cipher_and_org_with_group(cipher_uuid: &str, org_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+        db_run! { conn: {
+            users_organizations::table
+            .filter(users_organizations::org_uuid.eq(org_uuid))
+            .inner_join(groups_users::table.on(
+                groups_users::users_organizations_uuid.eq(users_organizations::uuid)
+            ))
+            .left_join(collections_groups::table.on(
+                collections_groups::groups_uuid.eq(groups_users::groups_uuid)
+            ))
+            .left_join(groups::table.on(groups::uuid.eq(groups_users::groups_uuid)))
+            .left_join(ciphers_collections::table.on(
+                    ciphers_collections::collection_uuid.eq(collections_groups::collections_uuid).and(ciphers_collections::cipher_uuid.eq(&cipher_uuid))
+
+                ))
+            .filter(
+                    groups::access_all.eq(true).or( // AccessAll via groups
+                        ciphers_collections::cipher_uuid.eq(&cipher_uuid) // ..or access to collection via group
+                    )
+                )
+                .select(users_organizations::all_columns)
+                .distinct()
+            .load::<UserOrganizationDb>(conn).expect("Error loading user organizations with groups").from_db()
+        }}
+    }
+
     pub async fn user_has_ge_admin_access_to_cipher(user_uuid: &str, cipher_uuid: &str, conn: &mut DbConn) -> bool {
         db_run! { conn: {
             users_organizations::table
@@ -776,6 +830,17 @@ impl UserOrganization {
             )
             .select(users_organizations::all_columns)
             .load::<UserOrganizationDb>(conn).expect("Error loading user organizations").from_db()
+        }}
+    }
+
+    pub async fn find_by_external_id_and_org(ext_id: &str, org_uuid: &str, conn: &mut DbConn) -> Option<Self> {
+        db_run! {conn: {
+            users_organizations::table
+            .filter(
+                users_organizations::external_id.eq(ext_id)
+                .and(users_organizations::org_uuid.eq(org_uuid))
+            )
+            .first::<UserOrganizationDb>(conn).ok().from_db()
         }}
     }
 }
@@ -820,6 +885,14 @@ impl OrganizationApiKey {
                 .filter(organization_api_key::org_uuid.eq(org_uuid))
                 .first::<OrganizationApiKeyDb>(conn)
                 .ok().from_db()
+        }}
+    }
+
+    pub async fn delete_all_by_organization(org_uuid: &str, conn: &mut DbConn) -> EmptyResult {
+        db_run! { conn: {
+            diesel::delete(organization_api_key::table.filter(organization_api_key::org_uuid.eq(org_uuid)))
+                .execute(conn)
+                .map_res("Error removing organization api key from organization")
         }}
     }
 }

@@ -1,16 +1,24 @@
-#!/bin/sh
+#!/usr/bin/env sh
 
 # Use the value of the corresponding env var (if present),
 # or a default value otherwise.
-: "${DATA_FOLDER:="data"}"
+: "${DATA_FOLDER:="/data"}"
 : "${ROCKET_PORT:="80"}"
+: "${ENV_FILE:="/.env"}"
 
 CONFIG_FILE="${DATA_FOLDER}"/config.json
+
+# Check if the $ENV_FILE file exist and is readable
+# If that is the case, load it into the environment before running any check
+if [ -r "${ENV_FILE}" ]; then
+    # shellcheck disable=SC1090
+    . "${ENV_FILE}"
+fi
 
 # Given a config key, return the corresponding config value from the
 # config file. If the key doesn't exist, return an empty string.
 get_config_val() {
-    local key="$1"
+    key="$1"
     # Extract a line of the form:
     #   "domain": "https://bw.example.com/path",
     grep "\"${key}\":" "${CONFIG_FILE}" |

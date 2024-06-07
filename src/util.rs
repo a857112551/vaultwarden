@@ -1,11 +1,10 @@
 //
 // Web Headers and caching
 //
-use std::{
-    io::{Cursor, ErrorKind},
-    ops::Deref,
-};
+use std::{collections::HashMap, io::Cursor, ops::Deref, path::Path};
 
+use num_traits::ToPrimitive;
+use once_cell::sync::Lazy;
 use rocket::{
     fairing::{Fairing, Info, Kind},
     http::{ContentType, Header, HeaderMap, Method, Status},
@@ -33,24 +32,42 @@ impl Fairing for AppHeaders {
     }
 
     async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
+        let req_uri_path = req.uri().path();
+        let req_headers = req.headers();
+
+        // Check if this connection is an Upgrade/WebSocket connection and return early
+        // We do not want add any extra headers, this could cause issues with reverse proxies or CloudFlare
+        if req_uri_path.ends_with("notifications/hub") || req_uri_path.ends_with("notifications/anonymous-hub") {
+            match (req_headers.get_one("connection"), req_headers.get_one("upgrade")) {
+                (Some(c), Some(u))
+                    if c.to_lowercase().contains("upgrade") && u.to_lowercase().contains("websocket") =>
+                {
+                    // Remove headers which could cause websocket connection issues
+                    res.remove_header("X-Frame-Options");
+                    res.remove_header("X-Content-Type-Options");
+                    res.remove_header("Permissions-Policy");
+                    return;
+                }
+                (_, _) => (),
+            }
+        }
+
         res.set_raw_header("Permissions-Policy", "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), display-capture=(), document-domain=(), encrypted-media=(), execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()");
         res.set_raw_header("Referrer-Policy", "same-origin");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
         // Obsolete in modern browsers, unsafe (XS-Leak), and largely replaced by CSP
         res.set_raw_header("X-XSS-Protection", "0");
 
-        let req_uri_path = req.uri().path();
-
         // Do not send the Content-Security-Policy (CSP) Header and X-Frame-Options for the *-connector.html files.
         // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
-        // This is the same behaviour as upstream Bitwarden.
+        // This is the same behavior as upstream Bitwarden.
         if !req_uri_path.ends_with("connector.html") {
             // # Frame Ancestors:
             // Chrome Web Store: https://chrome.google.com/webstore/detail/bitwarden-free-password-m/nngceckbapebfimnlniiiahkandclblb
             // Edge Add-ons: https://microsoftedge.microsoft.com/addons/detail/bitwarden-free-password/jbkfoedolllekgbhcbcoahefnbanhhlh?hl=en-US
             // Firefox Browser Add-ons: https://addons.mozilla.org/en-US/firefox/addon/bitwarden-password-manager/
             // # img/child/frame src:
-            // Have I Been Pwned and Gravator to allow those calls to work.
+            // Have I Been Pwned to allow those calls to work.
             // # Connect src:
             // Leaked Passwords check: api.pwnedpasswords.com
             // 2FA/MFA Site check: api.2fa.directory
@@ -72,7 +89,6 @@ impl Fairing for AppHeaders {
                   {allowed_iframe_ancestors}; \
                 img-src 'self' data: \
                   https://haveibeenpwned.com \
-                  https://www.gravatar.com \
                   {icon_service_csp}; \
                 connect-src 'self' \
                   https://api.pwnedpasswords.com \
@@ -199,7 +215,7 @@ impl<'r, R: 'r + Responder<'r, 'static> + Send> Responder<'r, 'static> for Cache
         res.set_raw_header("Cache-Control", cache_control_header);
 
         let time_now = chrono::Local::now();
-        let expiry_time = time_now + chrono::Duration::seconds(self.ttl.try_into().unwrap());
+        let expiry_time = time_now + chrono::TimeDelta::try_seconds(self.ttl.try_into().unwrap()).unwrap();
         res.set_raw_header("Expires", format_datetime_http(&expiry_time));
         Ok(res)
     }
@@ -315,52 +331,14 @@ impl Fairing for BetterLogging {
     }
 }
 
-//
-// File handling
-//
-use std::{
-    fs::{self, File},
-    io::Result as IOResult,
-    path::Path,
-};
-
-pub fn file_exists(path: &str) -> bool {
-    Path::new(path).exists()
-}
-
-pub fn write_file(path: &str, content: &[u8]) -> Result<(), crate::error::Error> {
-    use std::io::Write;
-    let mut f = match File::create(path) {
-        Ok(file) => file,
-        Err(e) => {
-            if e.kind() == ErrorKind::PermissionDenied {
-                error!("Can't create '{}': Permission denied", path);
-            }
-            return Err(From::from(e));
-        }
-    };
-
-    f.write_all(content)?;
-    f.flush()?;
-    Ok(())
-}
-
-pub fn delete_file(path: &str) -> IOResult<()> {
-    let res = fs::remove_file(path);
-
-    if let Some(parent) = Path::new(path).parent() {
-        // If the directory isn't empty, this returns an error, which we ignore
-        // We only want to delete the folder if it's empty
-        fs::remove_dir(parent).ok();
-    }
-
-    res
-}
-
-pub fn get_display_size(size: i32) -> String {
+pub fn get_display_size(size: i64) -> String {
     const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
 
-    let mut size: f64 = size.into();
+    // If we're somehow too big for a f64, just return the size in bytes
+    let Some(mut size) = size.to_f64() else {
+        return format!("{size} bytes");
+    };
+
     let mut unit_counter = 0;
 
     loop {
@@ -429,7 +407,7 @@ pub fn get_env_str_value(key: &str) -> Option<String> {
     match (value_from_env, value_file) {
         (Ok(_), Ok(_)) => panic!("You should not define both {key} and {key_file}!"),
         (Ok(v_env), Err(_)) => Some(v_env),
-        (Err(_), Ok(v_file)) => match fs::read_to_string(v_file) {
+        (Err(_), Ok(v_file)) => match std::fs::read_to_string(v_file) {
             Ok(content) => Some(content.trim().to_string()),
             Err(e) => panic!("Failed to load {key}: {e:?}"),
         },
@@ -516,14 +494,17 @@ pub fn parse_date(date: &str) -> NaiveDateTime {
 // Deployment environment methods
 //
 
-/// Returns true if the program is running in Docker or Podman.
-pub fn is_running_in_docker() -> bool {
-    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+/// Returns true if the program is running in Docker, Podman or Kubernetes.
+pub fn is_running_in_container() -> bool {
+    Path::new("/.dockerenv").exists()
+        || Path::new("/run/.containerenv").exists()
+        || Path::new("/run/secrets/kubernetes.io").exists()
+        || Path::new("/var/run/secrets/kubernetes.io").exists()
 }
 
-/// Simple check to determine on which docker base image vaultwarden is running.
+/// Simple check to determine on which container base image vaultwarden is running.
 /// We build images based upon Debian or Alpine, so these we check here.
-pub fn docker_base_image() -> &'static str {
+pub fn container_base_image() -> &'static str {
     if Path::new("/etc/debian_version").exists() {
         "Debian"
     } else if Path::new("/etc/alpine-release").exists() {
@@ -540,7 +521,7 @@ pub fn docker_base_image() -> &'static str {
 use std::fmt;
 
 use serde::de::{self, DeserializeOwned, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::{self, Value};
+use serde_json::Value;
 
 pub type JsonMap = serde_json::Map<String, Value>;
 
@@ -619,12 +600,53 @@ fn upcase_value(value: Value) -> Value {
     }
 }
 
-// Inner function to handle some speciale case for the 'ssn' key.
+// Inner function to handle a special case for the 'ssn' key.
 // This key is part of the Identity Cipher (Social Security Number)
 fn _process_key(key: &str) -> String {
     match key.to_lowercase().as_ref() {
         "ssn" => "SSN".into(),
         _ => self::upcase_first(key),
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum NumberOrString {
+    Number(i64),
+    String(String),
+}
+
+impl NumberOrString {
+    pub fn into_string(self) -> String {
+        match self {
+            NumberOrString::Number(n) => n.to_string(),
+            NumberOrString::String(s) => s,
+        }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_i32(&self) -> Result<i32, crate::Error> {
+        use std::num::ParseIntError as PIE;
+        match self {
+            NumberOrString::Number(n) => match n.to_i32() {
+                Some(n) => Ok(n),
+                None => err!("Number does not fit in i32"),
+            },
+            NumberOrString::String(s) => {
+                s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
+            }
+        }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    pub fn into_i64(&self) -> Result<i64, crate::Error> {
+        use std::num::ParseIntError as PIE;
+        match self {
+            NumberOrString::Number(n) => Ok(*n),
+            NumberOrString::String(s) => {
+                s.parse().map_err(|e: PIE| crate::Error::new("Can't convert to number", e.to_string()))
+            }
+        }
     }
 }
 
@@ -680,14 +702,9 @@ where
 
 use reqwest::{header, Client, ClientBuilder};
 
-pub fn get_reqwest_client() -> Client {
-    match get_reqwest_client_builder().build() {
-        Ok(client) => client,
-        Err(e) => {
-            error!("Possible trust-dns error, trying with trust-dns disabled: '{e}'");
-            get_reqwest_client_builder().trust_dns(false).build().expect("Failed to build client")
-        }
-    }
+pub fn get_reqwest_client() -> &'static Client {
+    static INSTANCE: Lazy<Client> = Lazy::new(|| get_reqwest_client_builder().build().expect("Failed to build client"));
+    &INSTANCE
 }
 
 pub fn get_reqwest_client_builder() -> ClientBuilder {
@@ -736,5 +753,258 @@ pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
         }
 
         value => value,
+    }
+}
+
+/// Parses the experimental client feature flags string into a HashMap.
+pub fn parse_experimental_client_feature_flags(experimental_client_feature_flags: &str) -> HashMap<String, bool> {
+    let feature_states =
+        experimental_client_feature_flags.to_lowercase().split(',').map(|f| (f.trim().to_owned(), true)).collect();
+
+    feature_states
+}
+
+mod dns_resolver {
+    use std::{
+        fmt,
+        net::{IpAddr, SocketAddr},
+        sync::Arc,
+    };
+
+    use hickory_resolver::{system_conf::read_system_conf, TokioAsyncResolver};
+    use once_cell::sync::Lazy;
+    use reqwest::dns::{Name, Resolve, Resolving};
+
+    use crate::{util::is_global, CONFIG};
+
+    #[derive(Debug, Clone)]
+    pub enum CustomResolverError {
+        Blacklist {
+            domain: String,
+        },
+        NonGlobalIp {
+            domain: String,
+            ip: IpAddr,
+        },
+    }
+
+    impl CustomResolverError {
+        pub fn downcast_ref(e: &dyn std::error::Error) -> Option<&Self> {
+            let mut source = e.source();
+
+            while let Some(err) = source {
+                source = err.source();
+                if let Some(err) = err.downcast_ref::<CustomResolverError>() {
+                    return Some(err);
+                }
+            }
+            None
+        }
+    }
+
+    impl fmt::Display for CustomResolverError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Blacklist {
+                    domain,
+                } => write!(f, "Blacklisted domain: {domain} matched ICON_BLACKLIST_REGEX"),
+                Self::NonGlobalIp {
+                    domain,
+                    ip,
+                } => write!(f, "IP {ip} for domain '{domain}' is not a global IP!"),
+            }
+        }
+    }
+
+    impl std::error::Error for CustomResolverError {}
+
+    #[derive(Debug, Clone)]
+    pub enum CustomDnsResolver {
+        Default(),
+        Hickory(Arc<TokioAsyncResolver>),
+    }
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+    impl CustomDnsResolver {
+        pub fn instance() -> Arc<Self> {
+            static INSTANCE: Lazy<Arc<CustomDnsResolver>> = Lazy::new(CustomDnsResolver::new);
+            Arc::clone(&*INSTANCE)
+        }
+
+        fn new() -> Arc<Self> {
+            match read_system_conf() {
+                Ok((config, opts)) => {
+                    let resolver = TokioAsyncResolver::tokio(config.clone(), opts.clone());
+                    Arc::new(Self::Hickory(Arc::new(resolver)))
+                }
+                Err(e) => {
+                    warn!("Error creating Hickory resolver, falling back to default: {e:?}");
+                    Arc::new(Self::Default())
+                }
+            }
+        }
+
+        // Note that we get an iterator of addresses, but we only grab the first one for convenience
+        async fn resolve_domain(&self, name: &str) -> Result<Option<SocketAddr>, BoxError> {
+            pre_resolve(name)?;
+
+            let result = match self {
+                Self::Default() => tokio::net::lookup_host(name).await?.next(),
+                Self::Hickory(r) => r.lookup_ip(name).await?.iter().next().map(|a| SocketAddr::new(a, 0)),
+            };
+
+            if let Some(addr) = &result {
+                post_resolve(name, addr.ip())?;
+            }
+
+            Ok(result)
+        }
+    }
+
+    fn pre_resolve(name: &str) -> Result<(), CustomResolverError> {
+        if crate::api::is_domain_blacklisted(name) {
+            return Err(CustomResolverError::Blacklist {
+                domain: name.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn post_resolve(name: &str, ip: IpAddr) -> Result<(), CustomResolverError> {
+        if CONFIG.icon_blacklist_non_global_ips() && !is_global(ip) {
+            Err(CustomResolverError::NonGlobalIp {
+                domain: name.to_string(),
+                ip,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    impl Resolve for CustomDnsResolver {
+        fn resolve(&self, name: Name) -> Resolving {
+            let this = self.clone();
+            Box::pin(async move {
+                let name = name.as_str();
+                let result = this.resolve_domain(name).await?;
+                Ok::<reqwest::dns::Addrs, _>(Box::new(result.into_iter()))
+            })
+        }
+    }
+}
+
+pub use dns_resolver::{CustomDnsResolver, CustomResolverError};
+
+/// TODO: This is extracted from IpAddr::is_global, which is unstable:
+/// https://doc.rust-lang.org/nightly/std/net/enum.IpAddr.html#method.is_global
+/// Remove once https://github.com/rust-lang/rust/issues/27709 is merged
+#[allow(clippy::nonminimal_bool)]
+#[cfg(any(not(feature = "unstable"), test))]
+pub fn is_global_hardcoded(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            !(ip.octets()[0] == 0 // "This network"
+            || ip.is_private()
+            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000 == 0b0100_0000)) //ip.is_shared()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            // addresses reserved for future protocols (`192.0.0.0/24`)
+            ||(ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0)
+            || ip.is_documentation()
+            || (ip.octets()[0] == 198 && (ip.octets()[1] & 0xfe) == 18) // ip.is_benchmarking()
+            || (ip.octets()[0] & 240 == 240 && !ip.is_broadcast()) //ip.is_reserved()
+            || ip.is_broadcast())
+        }
+        std::net::IpAddr::V6(ip) => {
+            !(ip.is_unspecified()
+            || ip.is_loopback()
+            // IPv4-mapped Address (`::ffff:0:0/96`)
+            || matches!(ip.segments(), [0, 0, 0, 0, 0, 0xffff, _, _])
+            // IPv4-IPv6 Translat. (`64:ff9b:1::/48`)
+            || matches!(ip.segments(), [0x64, 0xff9b, 1, _, _, _, _, _])
+            // Discard-Only Address Block (`100::/64`)
+            || matches!(ip.segments(), [0x100, 0, 0, 0, _, _, _, _])
+            // IETF Protocol Assignments (`2001::/23`)
+            || (matches!(ip.segments(), [0x2001, b, _, _, _, _, _, _] if b < 0x200)
+                && !(
+                    // Port Control Protocol Anycast (`2001:1::1`)
+                    u128::from_be_bytes(ip.octets()) == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                    // Traversal Using Relays around NAT Anycast (`2001:1::2`)
+                    || u128::from_be_bytes(ip.octets()) == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                    // AMT (`2001:3::/32`)
+                    || matches!(ip.segments(), [0x2001, 3, _, _, _, _, _, _])
+                    // AS112-v6 (`2001:4:112::/48`)
+                    || matches!(ip.segments(), [0x2001, 4, 0x112, _, _, _, _, _])
+                    // ORCHIDv2 (`2001:20::/28`)
+                    || matches!(ip.segments(), [0x2001, b, _, _, _, _, _, _] if (0x20..=0x2F).contains(&b))
+                ))
+            || ((ip.segments()[0] == 0x2001) && (ip.segments()[1] == 0xdb8)) // ip.is_documentation()
+            || ((ip.segments()[0] & 0xfe00) == 0xfc00) //ip.is_unique_local()
+            || ((ip.segments()[0] & 0xffc0) == 0xfe80)) //ip.is_unicast_link_local()
+        }
+    }
+}
+
+#[cfg(not(feature = "unstable"))]
+pub use is_global_hardcoded as is_global;
+
+#[cfg(feature = "unstable")]
+#[inline(always)]
+pub fn is_global(ip: std::net::IpAddr) -> bool {
+    ip.is_global()
+}
+
+/// These are some tests to check that the implementations match
+/// The IPv4 can be all checked in 30 seconds or so and they are correct as of nightly 2023-07-17
+/// The IPV6 can't be checked in a reasonable time, so we check over a hundred billion random ones, so far correct
+/// Note that the is_global implementation is subject to change as new IP RFCs are created
+///
+/// To run while showing progress output:
+/// cargo +nightly test --release --features sqlite,unstable -- --nocapture --ignored
+#[cfg(test)]
+#[cfg(feature = "unstable")]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    #[ignore]
+    fn test_ipv4_global() {
+        for a in 0..u8::MAX {
+            println!("Iter: {}/255", a);
+            for b in 0..u8::MAX {
+                for c in 0..u8::MAX {
+                    for d in 0..u8::MAX {
+                        let ip = IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
+                        assert_eq!(ip.is_global(), is_global_hardcoded(ip), "IP mismatch: {}", ip)
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ipv6_global() {
+        use rand::Rng;
+
+        std::thread::scope(|s| {
+            for t in 0..16 {
+                let handle = s.spawn(move || {
+                    let mut v = [0u8; 16];
+                    let mut rng = rand::thread_rng();
+
+                    for i in 0..20 {
+                        println!("Thread {t} Iter: {i}/50");
+                        for _ in 0..500_000_000 {
+                            rng.fill(&mut v);
+                            let ip = IpAddr::V6(std::net::Ipv6Addr::from(v));
+                            assert_eq!(ip.is_global(), is_global_hardcoded(ip), "IP mismatch: {ip}");
+                        }
+                    }
+                });
+            }
+        });
     }
 }

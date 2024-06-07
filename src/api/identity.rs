@@ -9,9 +9,12 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        core::accounts::{PreloginData, RegisterData, _prelogin, _register},
-        core::log_user_event,
-        core::two_factor::{duo, email, email::EmailTokenData, yubikey},
+        core::{
+            accounts::{PreloginData, RegisterData, _prelogin, _register},
+            log_user_event,
+            two_factor::{authenticator, duo, email, enforce_2fa_policy, webauthn, yubikey},
+        },
+        push::register_push_device,
         ApiResult, EmptyResult, JsonResult, JsonUpcase,
     },
     auth::{generate_organization_api_key_login_claims, ClientHeaders, ClientIp},
@@ -103,8 +106,13 @@ async fn _refresh_login(data: ConnectData, conn: &mut DbConn) -> JsonResult {
 
     // Common
     let user = User::find_by_uuid(&device.user_uuid, conn).await.unwrap();
-    let orgs = UserOrganization::find_confirmed_by_user(&user.uuid, conn).await;
-    let (access_token, expires_in) = device.refresh_tokens(&user, orgs, scope_vec);
+    // ---
+    // Disabled this variable, it was used to generate the JWT
+    // Because this might get used in the future, and is add by the Bitwarden Server, lets keep it, but then commented out
+    // See: https://github.com/dani-garcia/vaultwarden/issues/4156
+    // ---
+    // let orgs = UserOrganization::find_confirmed_by_user(&user.uuid, conn).await;
+    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec);
     device.save(conn).await?;
 
     let result = json!({
@@ -242,7 +250,7 @@ async fn _password_login(
 
     let (mut device, new_device) = get_device(&data, conn, &user).await;
 
-    let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, ip, conn).await?;
+    let twofactor_token = twofactor_auth(&user, &data, &mut device, ip, conn).await?;
 
     if CONFIG.mail_enabled() && new_device {
         if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &now, &device.name).await {
@@ -259,9 +267,19 @@ async fn _password_login(
         }
     }
 
+    // register push device
+    if !new_device {
+        register_push_device(&mut device, conn).await?;
+    }
+
     // Common
-    let orgs = UserOrganization::find_confirmed_by_user(&user.uuid, conn).await;
-    let (access_token, expires_in) = device.refresh_tokens(&user, orgs, scope_vec);
+    // ---
+    // Disabled this variable, it was used to generate the JWT
+    // Because this might get used in the future, and is add by the Bitwarden Server, lets keep it, but then commented out
+    // See: https://github.com/dani-garcia/vaultwarden/issues/4156
+    // ---
+    // let orgs = UserOrganization::find_confirmed_by_user(&user.uuid, conn).await;
+    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec);
     device.save(conn).await?;
 
     let mut result = json!({
@@ -277,7 +295,12 @@ async fn _password_login(
         "KdfIterations": user.client_kdf_iter,
         "KdfMemory": user.client_kdf_memory,
         "KdfParallelism": user.client_kdf_parallelism,
-        "ResetMasterPassword": false,// TODO: Same as above
+        "ResetMasterPassword": false, // TODO: Same as above
+        "ForcePasswordReset": false,
+        "MasterPasswordPolicy": {
+            "object": "masterPasswordPolicy",
+        },
+
         "scope": scope,
         "unofficialServer": true,
         "UserDecryptionOptions": {
@@ -374,8 +397,13 @@ async fn _user_api_key_login(
 
     // Common
     let scope_vec = vec!["api".into()];
-    let orgs = UserOrganization::find_confirmed_by_user(&user.uuid, conn).await;
-    let (access_token, expires_in) = device.refresh_tokens(&user, orgs, scope_vec);
+    // ---
+    // Disabled this variable, it was used to generate the JWT
+    // Because this might get used in the future, and is add by the Bitwarden Server, lets keep it, but then commented out
+    // See: https://github.com/dani-garcia/vaultwarden/issues/4156
+    // ---
+    // let orgs = UserOrganization::find_confirmed_by_user(&user.uuid, conn).await;
+    let (access_token, expires_in) = device.refresh_tokens(&user, scope_vec);
     device.save(conn).await?;
 
     info!("User {} logged in successfully via API key. IP: {}", user.email, ip.ip);
@@ -453,32 +481,32 @@ async fn get_device(data: &ConnectData, conn: &mut DbConn, user: &User) -> (Devi
 }
 
 async fn twofactor_auth(
-    user_uuid: &str,
+    user: &User,
     data: &ConnectData,
     device: &mut Device,
     ip: &ClientIp,
     conn: &mut DbConn,
 ) -> ApiResult<Option<String>> {
-    let twofactors = TwoFactor::find_by_user(user_uuid, conn).await;
+    let twofactors = TwoFactor::find_by_user(&user.uuid, conn).await;
 
     // No twofactor token if twofactor is disabled
     if twofactors.is_empty() {
+        enforce_2fa_policy(user, &user.uuid, device.atype, &ip.ip, conn).await?;
         return Ok(None);
     }
 
-    TwoFactorIncomplete::mark_incomplete(user_uuid, &device.uuid, &device.name, ip, conn).await?;
+    TwoFactorIncomplete::mark_incomplete(&user.uuid, &device.uuid, &device.name, ip, conn).await?;
 
     let twofactor_ids: Vec<_> = twofactors.iter().map(|tf| tf.atype).collect();
     let selected_id = data.two_factor_provider.unwrap_or(twofactor_ids[0]); // If we aren't given a two factor provider, assume the first one
 
     let twofactor_code = match data.two_factor_token {
         Some(ref code) => code,
-        None => err_json!(_json_err_twofactor(&twofactor_ids, user_uuid, conn).await?, "2FA token not provided"),
+        None => err_json!(_json_err_twofactor(&twofactor_ids, &user.uuid, conn).await?, "2FA token not provided"),
     };
 
     let selected_twofactor = twofactors.into_iter().find(|tf| tf.atype == selected_id && tf.enabled);
 
-    use crate::api::core::two_factor as _tf;
     use crate::crypto::ct_eq;
 
     let selected_data = _selected_data(selected_twofactor);
@@ -486,17 +514,15 @@ async fn twofactor_auth(
 
     match TwoFactorType::from_i32(selected_id) {
         Some(TwoFactorType::Authenticator) => {
-            _tf::authenticator::validate_totp_code_str(user_uuid, twofactor_code, &selected_data?, ip, conn).await?
+            authenticator::validate_totp_code_str(&user.uuid, twofactor_code, &selected_data?, ip, conn).await?
         }
-        Some(TwoFactorType::Webauthn) => {
-            _tf::webauthn::validate_webauthn_login(user_uuid, twofactor_code, conn).await?
-        }
-        Some(TwoFactorType::YubiKey) => _tf::yubikey::validate_yubikey_login(twofactor_code, &selected_data?).await?,
+        Some(TwoFactorType::Webauthn) => webauthn::validate_webauthn_login(&user.uuid, twofactor_code, conn).await?,
+        Some(TwoFactorType::YubiKey) => yubikey::validate_yubikey_login(twofactor_code, &selected_data?).await?,
         Some(TwoFactorType::Duo) => {
-            _tf::duo::validate_duo_login(data.username.as_ref().unwrap().trim(), twofactor_code, conn).await?
+            duo::validate_duo_login(data.username.as_ref().unwrap().trim(), twofactor_code, conn).await?
         }
         Some(TwoFactorType::Email) => {
-            _tf::email::validate_email_code_str(user_uuid, twofactor_code, &selected_data?, conn).await?
+            email::validate_email_code_str(&user.uuid, twofactor_code, &selected_data?, conn).await?
         }
 
         Some(TwoFactorType::Remember) => {
@@ -506,7 +532,7 @@ async fn twofactor_auth(
                 }
                 _ => {
                     err_json!(
-                        _json_err_twofactor(&twofactor_ids, user_uuid, conn).await?,
+                        _json_err_twofactor(&twofactor_ids, &user.uuid, conn).await?,
                         "2FA Remember token not provided"
                     )
                 }
@@ -520,7 +546,7 @@ async fn twofactor_auth(
         ),
     }
 
-    TwoFactorIncomplete::mark_complete(user_uuid, &device.uuid, conn).await?;
+    TwoFactorIncomplete::mark_complete(&user.uuid, &device.uuid, conn).await?;
 
     if !CONFIG.disable_2fa_remember() && remember == 1 {
         Ok(Some(device.refresh_twofactor_remember()))
@@ -535,8 +561,6 @@ fn _selected_data(tf: Option<TwoFactor>) -> ApiResult<String> {
 }
 
 async fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &mut DbConn) -> ApiResult<Value> {
-    use crate::api::core::two_factor;
-
     let mut result = json!({
         "error" : "invalid_grant",
         "error_description" : "Two factor required.",
@@ -551,7 +575,7 @@ async fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &mut DbCo
             Some(TwoFactorType::Authenticator) => { /* Nothing to do for TOTP */ }
 
             Some(TwoFactorType::Webauthn) if CONFIG.domain_set() => {
-                let request = two_factor::webauthn::generate_webauthn_login(user_uuid, conn).await?;
+                let request = webauthn::generate_webauthn_login(user_uuid, conn).await?;
                 result["TwoFactorProviders2"][provider.to_string()] = request.0;
             }
 
@@ -583,8 +607,6 @@ async fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &mut DbCo
             }
 
             Some(tf_type @ TwoFactorType::Email) => {
-                use crate::api::core::two_factor as _tf;
-
                 let twofactor = match TwoFactor::find_by_user_and_type(user_uuid, tf_type as i32, conn).await {
                     Some(tf) => tf,
                     None => err!("No twofactor email registered"),
@@ -592,10 +614,10 @@ async fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &mut DbCo
 
                 // Send email immediately if email is the only 2FA option
                 if providers.len() == 1 {
-                    _tf::email::send_token(user_uuid, conn).await?
+                    email::send_token(user_uuid, conn).await?
                 }
 
-                let email_data = EmailTokenData::from_json(&twofactor.data)?;
+                let email_data = email::EmailTokenData::from_json(&twofactor.data)?;
                 result["TwoFactorProviders2"][provider.to_string()] = json!({
                     "Email": email::obscure_email(&email_data.email),
                 })

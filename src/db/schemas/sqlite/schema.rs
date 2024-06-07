@@ -3,7 +3,7 @@ table! {
         id -> Text,
         cipher_uuid -> Text,
         file_name -> Text,
-        file_size -> Integer,
+        file_size -> BigInt,
         akey -> Nullable<Text>,
     }
 }
@@ -15,6 +15,7 @@ table! {
         updated_at -> Timestamp,
         user_uuid -> Nullable<Text>,
         organization_uuid -> Nullable<Text>,
+        key -> Nullable<Text>,
         atype -> Integer,
         name -> Text,
         notes -> Nullable<Text>,
@@ -159,7 +160,7 @@ table! {
         atype -> Integer,
         enabled -> Bool,
         data -> Text,
-        last_used -> Integer,
+        last_used -> BigInt,
     }
 }
 
@@ -228,6 +229,7 @@ table! {
         status -> Integer,
         atype -> Integer,
         reset_password_key -> Nullable<Text>,
+        external_id -> Nullable<Text>,
     }
 }
 

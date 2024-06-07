@@ -13,7 +13,6 @@ pub use ciphers::{purge_trashed_ciphers, CipherData, CipherSyncData, CipherSyncT
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
 pub use sends::purge_sends;
-pub use two_factor::send_incomplete_2fa_notifications;
 
 pub fn routes() -> Vec<Route> {
     let mut eq_domains_routes = routes![get_eq_domains, post_eq_domains, put_eq_domains];
@@ -47,15 +46,14 @@ pub fn events_routes() -> Vec<Route> {
 //
 // Move this somewhere else
 //
-use rocket::{serde::json::Json, Catcher, Route};
-use serde_json::Value;
+use rocket::{serde::json::Json, serde::json::Value, Catcher, Route};
 
 use crate::{
     api::{JsonResult, JsonUpcase, Notify, UpdateType},
     auth::Headers,
     db::DbConn,
     error::Error,
-    util::get_reqwest_client,
+    util::{get_reqwest_client, parse_experimental_client_feature_flags},
 };
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -193,12 +191,22 @@ fn version() -> Json<&'static str> {
 #[get("/config")]
 fn config() -> Json<Value> {
     let domain = crate::CONFIG.domain();
+    let mut feature_states =
+        parse_experimental_client_feature_flags(&crate::CONFIG.experimental_client_feature_flags());
+    // Force the new key rotation feature
+    feature_states.insert("key-rotation-improvements".to_string(), true);
     Json(json!({
-        "version": crate::VERSION,
+        // Note: The clients use this version to handle backwards compatibility concerns
+        // This means they expect a version that closely matches the Bitwarden server version
+        // We should make sure that we keep this updated when we support the new server features
+        // Version history:
+        // - Individual cipher key encryption: 2023.9.1
+        "version": "2024.2.0",
         "gitHash": option_env!("GIT_REV"),
         "server": {
           "name": "Vaultwarden",
-          "url": "https://github.com/dani-garcia/vaultwarden"
+          "url": "https://github.com/dani-garcia/vaultwarden",
+          "version": crate::VERSION
         },
         "environment": {
           "vault": domain,
@@ -207,6 +215,7 @@ fn config() -> Json<Value> {
           "notifications": format!("{domain}/notifications"),
           "sso": "",
         },
+        "featureStates": feature_states,
         "object": "config",
     }))
 }
