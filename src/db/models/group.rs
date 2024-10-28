@@ -1,3 +1,7 @@
+use super::{User, UserOrgType, UserOrganization};
+use crate::api::EmptyResult;
+use crate::db::DbConn;
+use crate::error::MapResult;
 use chrono::{NaiveDateTime, Utc};
 use serde_json::Value;
 
@@ -58,38 +62,39 @@ impl Group {
         use crate::util::format_date;
 
         json!({
-            "Id": self.uuid,
-            "OrganizationId": self.organizations_uuid,
-            "Name": self.name,
-            "AccessAll": self.access_all,
-            "ExternalId": self.external_id,
-            "CreationDate": format_date(&self.creation_date),
-            "RevisionDate": format_date(&self.revision_date),
-            "Object": "group"
+            "id": self.uuid,
+            "organizationId": self.organizations_uuid,
+            "name": self.name,
+            "accessAll": self.access_all,
+            "externalId": self.external_id,
+            "creationDate": format_date(&self.creation_date),
+            "revisionDate": format_date(&self.revision_date),
+            "object": "group"
         })
     }
 
-    pub async fn to_json_details(&self, conn: &mut DbConn) -> Value {
+    pub async fn to_json_details(&self, user_org_type: &i32, conn: &mut DbConn) -> Value {
         let collections_groups: Vec<Value> = CollectionGroup::find_by_group(&self.uuid, conn)
             .await
             .iter()
             .map(|entry| {
                 json!({
-                    "Id": entry.collections_uuid,
-                    "ReadOnly": entry.read_only,
-                    "HidePasswords": entry.hide_passwords
+                    "id": entry.collections_uuid,
+                    "readOnly": entry.read_only,
+                    "hidePasswords": entry.hide_passwords,
+                    "manage": *user_org_type >= UserOrgType::Admin || (*user_org_type == UserOrgType::Manager && !entry.read_only && !entry.hide_passwords)
                 })
             })
             .collect();
 
         json!({
-            "Id": self.uuid,
-            "OrganizationId": self.organizations_uuid,
-            "Name": self.name,
-            "AccessAll": self.access_all,
-            "ExternalId": self.external_id,
-            "Collections": collections_groups,
-            "Object": "groupDetails"
+            "id": self.uuid,
+            "organizationId": self.organizations_uuid,
+            "name": self.name,
+            "accessAll": self.access_all,
+            "externalId": self.external_id,
+            "collections": collections_groups,
+            "object": "groupDetails"
         })
     }
 
@@ -121,13 +126,6 @@ impl GroupUser {
         }
     }
 }
-
-use crate::db::DbConn;
-
-use crate::api::EmptyResult;
-use crate::error::MapResult;
-
-use super::{User, UserOrganization};
 
 /// Database methods
 impl Group {

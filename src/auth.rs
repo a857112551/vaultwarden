@@ -1,13 +1,18 @@
 // JWT Handling
 //
 use chrono::{TimeDelta, Utc};
+use jsonwebtoken::{errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header};
 use num_traits::FromPrimitive;
 use once_cell::sync::{Lazy, OnceCell};
-
-use jsonwebtoken::{errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header};
 use openssl::rsa::Rsa;
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
+use std::{
+    env,
+    fs::File,
+    io::{Read, Write},
+    net::IpAddr,
+};
 
 use crate::{error::Error, CONFIG};
 
@@ -30,28 +35,37 @@ static JWT_FILE_DOWNLOAD_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|file_do
 static PRIVATE_RSA_KEY: OnceCell<EncodingKey> = OnceCell::new();
 static PUBLIC_RSA_KEY: OnceCell<DecodingKey> = OnceCell::new();
 
-pub fn initialize_keys() -> Result<(), crate::error::Error> {
-    let mut priv_key_buffer = Vec::with_capacity(2048);
+pub fn initialize_keys() -> Result<(), Error> {
+    fn read_key(create_if_missing: bool) -> Result<(Rsa<openssl::pkey::Private>, Vec<u8>), Error> {
+        let mut priv_key_buffer = Vec::with_capacity(2048);
 
-    let priv_key = {
-        let mut priv_key_file =
-            File::options().create(true).truncate(false).read(true).write(true).open(CONFIG.private_rsa_key())?;
+        let mut priv_key_file = File::options()
+            .create(create_if_missing)
+            .truncate(false)
+            .read(true)
+            .write(create_if_missing)
+            .open(CONFIG.private_rsa_key())?;
 
         #[allow(clippy::verbose_file_reads)]
         let bytes_read = priv_key_file.read_to_end(&mut priv_key_buffer)?;
 
-        if bytes_read > 0 {
+        let rsa_key = if bytes_read > 0 {
             Rsa::private_key_from_pem(&priv_key_buffer[..bytes_read])?
-        } else {
+        } else if create_if_missing {
             // Only create the key if the file doesn't exist or is empty
-            let rsa_key = openssl::rsa::Rsa::generate(2048)?;
+            let rsa_key = Rsa::generate(2048)?;
             priv_key_buffer = rsa_key.private_key_to_pem()?;
             priv_key_file.write_all(&priv_key_buffer)?;
-            info!("Private key created correctly.");
+            info!("Private key '{}' created correctly", CONFIG.private_rsa_key());
             rsa_key
-        }
-    };
+        } else {
+            err!("Private key does not exist or invalid format", CONFIG.private_rsa_key());
+        };
 
+        Ok((rsa_key, priv_key_buffer))
+    }
+
+    let (priv_key, priv_key_buffer) = read_key(true).or_else(|_| read_key(false))?;
     let pub_key_buffer = priv_key.public_key_to_pem()?;
 
     let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;
@@ -379,8 +393,6 @@ impl<'r> FromRequest<'r> for Host {
             referer.to_string()
         } else {
             // Try to guess from the headers
-            use std::env;
-
             let protocol = if let Some(proto) = headers.get_one("X-Forwarded-Proto") {
                 proto
             } else if env::var("ROCKET_TLS").is_ok() {
@@ -405,7 +417,6 @@ impl<'r> FromRequest<'r> for Host {
 }
 
 pub struct ClientHeaders {
-    pub host: String,
     pub device_type: i32,
     pub ip: ClientIp,
 }
@@ -415,7 +426,6 @@ impl<'r> FromRequest<'r> for ClientHeaders {
     type Error = &'static str;
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let host = try_outcome!(Host::from_request(request).await).host;
         let ip = match ClientIp::from_request(request).await {
             Outcome::Success(ip) => ip,
             _ => err_handler!("Error getting Client IP"),
@@ -425,7 +435,6 @@ impl<'r> FromRequest<'r> for ClientHeaders {
             request.headers().get_one("device-type").map(|d| d.parse().unwrap_or(14)).unwrap_or_else(|| 14);
 
         Outcome::Success(ClientHeaders {
-            host,
             device_type,
             ip,
         })
@@ -531,7 +540,6 @@ pub struct OrgHeaders {
     pub user: User,
     pub org_user_type: UserOrgType,
     pub org_user: UserOrganization,
-    pub org_id: String,
     pub ip: ClientIp,
 }
 
@@ -594,7 +602,6 @@ impl<'r> FromRequest<'r> for OrgHeaders {
                         }
                     },
                     org_user,
-                    org_id: String::from(org_id),
                     ip: headers.ip,
                 })
             }
@@ -671,7 +678,6 @@ pub struct ManagerHeaders {
     pub host: String,
     pub device: Device,
     pub user: User,
-    pub org_user_type: UserOrgType,
     pub ip: ClientIp,
 }
 
@@ -700,7 +706,6 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
-                org_user_type: headers.org_user_type,
                 ip: headers.ip,
             })
         } else {
@@ -727,7 +732,6 @@ pub struct ManagerHeadersLoose {
     pub device: Device,
     pub user: User,
     pub org_user: UserOrganization,
-    pub org_user_type: UserOrgType,
     pub ip: ClientIp,
 }
 
@@ -743,7 +747,6 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 device: headers.device,
                 user: headers.user,
                 org_user: headers.org_user,
-                org_user_type: headers.org_user_type,
                 ip: headers.ip,
             })
         } else {
@@ -782,14 +785,12 @@ impl ManagerHeaders {
             host: h.host,
             device: h.device,
             user: h.user,
-            org_user_type: h.org_user_type,
             ip: h.ip,
         })
     }
 }
 
 pub struct OwnerHeaders {
-    pub host: String,
     pub device: Device,
     pub user: User,
     pub ip: ClientIp,
@@ -803,7 +804,6 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
         if headers.org_user_type == UserOrgType::Owner {
             Outcome::Success(Self {
-                host: headers.host,
                 device: headers.device,
                 user: headers.user,
                 ip: headers.ip,
@@ -817,11 +817,6 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
 //
 // Client IP address detection
 //
-use std::{
-    fs::File,
-    io::{Read, Write},
-    net::IpAddr,
-};
 
 pub struct ClientIp {
     pub ip: IpAddr,
@@ -850,6 +845,35 @@ impl<'r> FromRequest<'r> for ClientIp {
 
         Outcome::Success(ClientIp {
             ip,
+        })
+    }
+}
+
+pub struct Secure {
+    pub https: bool,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Secure {
+    type Error = ();
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let headers = request.headers();
+
+        // Try to guess from the headers
+        let protocol = match headers.get_one("X-Forwarded-Proto") {
+            Some(proto) => proto,
+            None => {
+                if env::var("ROCKET_TLS").is_ok() {
+                    "https"
+                } else {
+                    "http"
+                }
+            }
+        };
+
+        Outcome::Success(Secure {
+            https: protocol == "https",
         })
     }
 }
